@@ -3812,3 +3812,90 @@ paxNameStricts.forEach(strict => {
     })
   })
 })
+
+// A compressed archive must not be expanded without bound: a few-KB gzip
+// bomb otherwise inflates to unlimited memory/disk.  (CVE-2026-59873)
+// note: the payload is concatenated rather than passed to makeTar(), which
+// caps every chunk it is given at a single 512-byte block.
+const makeCompressedBomb = size => require('zlib').gzipSync(Buffer.concat([
+  makeTar([{ path: 'bomb', size: size, type: 'File' }]),
+  Buffer.alloc(size),
+  makeTar([ '', '' ])
+]))
+
+t.test('max decompression ratio', t => {
+  const payloadSize = 8 * 1024 * 1024
+  const data = makeCompressedBomb(payloadSize)
+
+  t.test('aborts compressed bombs by default', t => {
+    // note: with the default limit an all-zeros payload gzips at close to
+    // deflate's 1032:1 ceiling, so the ratio only crosses 1000 near the very
+    // end of decompression -- whether the entry is truncated on disk varies
+    // with the zlib version.  Early truncation is asserted separately, with an
+    // explicit low ratio, in 'aborting disposes the decompressor' below.
+    t.plan(2)
+    const cwd = testdir()
+    new Unpack({ cwd: cwd })
+      .once('error', er => {
+        t.match(er.message, /^max decompression ratio exceeded: /, 'async aborts')
+      })
+      .end(data)
+
+    const scwd = testdir()
+    t.throws(_ => new UnpackSync({ cwd: scwd }).end(data), {
+      message: /^max decompression ratio exceeded: /
+    }, 'sync throws')
+  })
+
+  t.test('can be disabled explicitly', t => {
+    const cwd = testdir()
+    const u = new Unpack({
+      cwd: cwd,
+      maxDecompressionRatio: Infinity
+    })
+    u.on('error', er => t.fail(er.message))
+    u.on('close', _ => {
+      t.equal(fs.statSync(path.resolve(cwd, 'bomb')).size, payloadSize)
+      t.end()
+    })
+    u.end(data)
+  })
+
+  t.test('can be disabled explicitly, sync', t => {
+    const cwd = testdir()
+    new UnpackSync({
+      cwd: cwd,
+      maxDecompressionRatio: Infinity
+    }).end(data)
+    t.equal(fs.statSync(path.resolve(cwd, 'bomb')).size, payloadSize)
+    t.end()
+  })
+
+  t.end()
+})
+
+t.test('aborting disposes the decompressor so it stops expanding', t => {
+  // CVE-2026-59873 v7.5.20 follow-up: abort() must dispose the unzip stream,
+  // otherwise minizlib keeps expanding the whole bomb into memory after the
+  // ratio abort has already fired.
+  const payloadSize = 20 * 1024 * 1024
+  const data = makeCompressedBomb(payloadSize)
+  const cwd = testdir()
+  const u = new Unpack({ cwd: cwd, maxDecompressionRatio: 2 })
+  let aborted = false
+  u.on('error', er => {
+    aborted = /^max decompression ratio exceeded: /.test(er.message)
+  })
+  u.end(data)
+  // give any un-disposed decompressor time to keep expanding; with the fix the
+  // decompressed byte count stays pinned near where the ratio tripped.
+  setTimeout(_ => {
+    t.ok(aborted, 'aborted on the decompression ratio')
+    const syms = Object.getOwnPropertySymbols(u).filter(
+      s => s.toString() === 'Symbol(decompressedBytesRead)')
+    t.equal(syms.length, 1, 'found the decompressed byte counter')
+    t.ok(u[syms[0]] < payloadSize,
+      'decompression stopped early: ' + u[syms[0]] + ' < ' + payloadSize)
+    t.end()
+  }, 500)
+})

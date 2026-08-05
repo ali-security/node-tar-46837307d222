@@ -295,3 +295,77 @@ paxNameStricts.forEach(strict => {
     })
   })
 })
+
+// A compressed archive must not be expanded without bound: a few-KB gzip
+// bomb otherwise inflates to unlimited memory/disk.  (CVE-2026-59873)
+t.test('max decompression ratio', t => {
+  const zlib = require('zlib')
+  const payloadSize = 8 * 1024 * 1024
+  // note: the payload is concatenated rather than passed to makeTar(), which
+  // caps every chunk it is given at a single 512-byte block.
+  const bomb = zlib.gzipSync(Buffer.concat([
+    makeTar([{ path: 'bomb', size: payloadSize, type: 'File' }]),
+    Buffer.alloc(payloadSize),
+    makeTar([ '', '' ])
+  ]))
+
+  const bombdir = path.resolve(extractdir, 'bomb')
+  const file = path.resolve(bombdir, 'bomb.tgz')
+  const setup = which => {
+    const dir = path.resolve(bombdir, which)
+    rimraf.sync(dir)
+    mkdirp.sync(dir)
+    return dir
+  }
+
+  t.test('setup', t => {
+    rimraf.sync(bombdir)
+    mkdirp.sync(bombdir)
+    fs.writeFileSync(file, bomb)
+    t.end()
+  })
+
+  t.test('file extraction aborts by default', t => {
+    const cwd = setup('sync-abort')
+    t.throws(_ => x({ sync: true, file: file, cwd: cwd }), {
+      message: /^max decompression ratio exceeded: /
+    }, 'sync throws')
+
+    const acwd = setup('async-abort')
+    x({ file: file, cwd: acwd }).then(_ => {
+      t.fail('async extraction should have been aborted')
+      t.end()
+    }, er => {
+      t.match(er.message, /^max decompression ratio exceeded: /, 'async rejects')
+      t.end()
+    })
+  })
+
+  t.test('file extraction can disable the limit explicitly', t => {
+    const cwd = setup('sync-unlimited')
+    x({
+      sync: true,
+      file: file,
+      cwd: cwd,
+      maxDecompressionRatio: Infinity
+    })
+    t.equal(fs.statSync(path.resolve(cwd, 'bomb')).size, payloadSize,
+      'sync extracted the whole file')
+
+    const acwd = setup('async-unlimited')
+    x({
+      file: file,
+      cwd: acwd,
+      maxDecompressionRatio: Infinity
+    }).then(_ => {
+      t.equal(fs.statSync(path.resolve(acwd, 'bomb')).size, payloadSize,
+        'async extracted the whole file')
+      t.end()
+    }, er => {
+      t.fail(er.message)
+      t.end()
+    })
+  })
+
+  t.end()
+})

@@ -595,3 +595,52 @@ t.test('end while consuming', t => {
   mp.end(data)
   mp.pipe(p)
 })
+
+// A compressed archive must not be expanded without bound: a few-KB gzip
+// bomb otherwise inflates to unlimited memory/disk.  (CVE-2026-59873)
+t.test('max decompression ratio', t => {
+  // note: the payload is concatenated rather than passed to makeTar(), which
+  // caps every chunk it is given at a single 512-byte block.
+  const makeCompressedBomb = size => zlib.gzipSync(Buffer.concat([
+    makeTar([{ path: 'bomb', size: size, type: 'File' }]),
+    Buffer.alloc(size),
+    makeTar([ '', '' ])
+  ]))
+  const bomb = makeCompressedBomb(8 * 1024 * 1024)
+
+  t.test('parsing aborts by default', t => {
+    const p = new Parse({})
+    t.throws(_ => p.end(bomb), {
+      message: /^max decompression ratio exceeded: /
+    }, 'parsing aborts')
+    // no-op to abort again
+    p.abort('hello', new Error('hello'))
+    t.end()
+  })
+
+  t.test('aborting only happens one time', t => {
+    const p = new Parse({})
+    t.throws(_ => p.abort('hello', new Error('hello')), { message: 'hello' })
+    // this is ignored
+    p.end(bomb)
+    t.end()
+  })
+
+  t.test('parsing can disable the limit explicitly', t => {
+    let bytesRead = 0
+    const p = new Parse({
+      maxDecompressionRatio: Infinity,
+      onentry: e => {
+        e.on('data', c => bytesRead += c.length)
+        e.resume()
+      }
+    })
+    p.on('end', _ => {
+      t.equal(bytesRead, 8 * 1024 * 1024)
+      t.end()
+    })
+    p.end(bomb)
+  })
+
+  t.end()
+})

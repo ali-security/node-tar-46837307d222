@@ -2802,3 +2802,68 @@ t.test('drop entry from dirCache if no longer a directory', t => {
     check(t, path)
   })
 })
+
+// CVE-2021-37701: the dirCache purge used to be a byte-exact string
+// comparison, so a symlink entry whose name differed from a previously
+// cached directory only by letter case (or by directory separator) left
+// the stale directory in the cache.  On a case-insensitive filesystem the
+// symlink then aliased that directory, and the next entry underneath it
+// took the cache hit, skipped the symlink check in mkdir, and was written
+// straight through the link -- an arbitrary file write.
+//
+// A case-insensitive filesystem cannot be simulated on the Linux CI
+// filesystem, so assert the pruning itself: after the differently-cased
+// symlink entry, neither the stale directory nor any of its children may
+// remain in the dirCache.
+t.test('prune dirCache case-insensitively', t => {
+  const dir = path.resolve(unpackdir, 'prune-cache-case')
+  mkdirp.sync(dir + '/sync')
+  mkdirp.sync(dir + '/async')
+  const data = makeTar([
+    {
+      path: 'Y',
+      type: 'Directory'
+    },
+    {
+      path: 'Y/child',
+      type: 'Directory'
+    },
+    {
+      path: 'y',
+      type: 'SymbolicLink',
+      linkpath: './z'
+    },
+    '',
+    ''
+  ])
+
+  const check = (t, cwd, dirCache) => {
+    // the differently-cased directory, and everything under it, must be
+    // gone from the cache once the symlink took its place.
+    t.equal(dirCache.has(cwd + '/Y'), false, 'stale dir pruned')
+    t.equal(dirCache.has(cwd + '/Y/child'), false, 'stale child pruned')
+    // the extraction root itself is not a prefix match, so it survives.
+    t.equal(dirCache.get(cwd), true, 'cwd left in cache')
+    t.end()
+  }
+
+  t.plan(2)
+
+  t.test('async', t => {
+    const cwd = dir + '/async'
+    const dirCache = new Map()
+    new Unpack({ cwd: cwd, dirCache: dirCache })
+      .on('warn', _ => _)
+      .on('end', () => check(t, cwd, dirCache))
+      .end(data)
+  })
+
+  t.test('sync', t => {
+    const cwd = dir + '/sync'
+    const dirCache = new Map()
+    new UnpackSync({ cwd: cwd, dirCache: dirCache })
+      .on('warn', _ => _)
+      .end(data)
+    check(t, cwd, dirCache)
+  })
+})

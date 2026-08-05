@@ -2200,7 +2200,26 @@ t.test('transform', t => {
 t.test('transform error', t => {
   const dir = path.resolve(unpackdir, 'transform-error')
   mkdirp.sync(dir)
-  t.teardown(_ => rimraf.sync(dir))
+  // The async transform-error subtests abandon their writes mid-flight, so
+  // stray files can still land in dir just after the subtests resolve. A
+  // single rimraf.sync races them and dies with ENOTEMPTY on slower Node
+  // versions, so retry a bounded number of times, only rethrowing on the
+  // final attempt. Synchronous on purpose: this file must parse on Node 4.
+  t.teardown(_ => {
+    var attempts = 10
+    for (var i = 0; i < attempts; i++) {
+      try {
+        rimraf.sync(dir)
+        return
+      } catch (er) {
+        if (i === attempts - 1)
+          throw er
+        // busy-wait briefly to let the abandoned writes settle
+        var until = Date.now() + 100
+        while (Date.now() < until) {}
+      }
+    }
+  })
 
   const tarfile = path.resolve(tars, 'body-byte-counts.tar')
   const tardata = fs.readFileSync(tarfile)

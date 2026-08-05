@@ -1,0 +1,62 @@
+name: seal-build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["11", "4", "6", "8", "10"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pin the npm registry to the release-date time machine
+        run: |
+          cat >> "$HOME/.npmrc" <<'EOF'
+          registry=https://time-machines-npm.sealsecurity.io/
+          //time-machines-npm.sealsecurity.io/:_authToken=2018-11-08T23:53:21.416000Z
+          EOF
+
+      - name: Install nvm
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
+
+      - name: Install dependencies under Node 11
+        run: |
+          export NVM_DIR="$HOME/.nvm"
+          . "$NVM_DIR/nvm.sh"
+          nvm install 11
+          nvm use 11
+          node -v
+          npm -v
+          npm ci
+
+      - name: Run the test suite on Node ${{ matrix.node }}
+        run: |
+          export NVM_DIR="$HOME/.nvm"
+          . "$NVM_DIR/nvm.sh"
+          nvm install ${{ matrix.node }}
+          nvm use ${{ matrix.node }}
+          node -v
+          node ./node_modules/.bin/tap test/*.js -J -c --no-coverage
+
+      - name: Pack the release tarball
+        if: matrix.node == '11'
+        run: |
+          export NVM_DIR="$HOME/.nvm"
+          . "$NVM_DIR/nvm.sh"
+          nvm use 11
+          npm pack
+          ls -l tar-4.4.8.tgz
+
+      - name: Upload the release tarball
+        if: matrix.node == '11'
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-tarball
+          path: tar-4.4.8.tgz
+          if-no-files-found: error

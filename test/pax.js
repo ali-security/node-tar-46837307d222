@@ -313,3 +313,34 @@ t.test('no negative size', t => {
   })
   t.end()
 })
+
+t.test('string fields stay string', t => {
+  // a numeric-looking value for a string field must not be coerced to a
+  // Number, and an unknown key is dropped rather than guessed at.
+  const parsed = Pax.parse(
+    '14 path=12345\n18 linkpath=54321\n13 WAT=12345\n15 ctime=12345\n'
+  )
+  // t.same is loose about 12345 vs '12345', so assert the types outright
+  t.equal(typeof parsed.path, 'string', 'path stayed a string')
+  t.equal(typeof parsed.linkpath, 'string', 'linkpath stayed a string')
+  t.equal(parsed.WAT, undefined, 'unknown key dropped')
+  t.same(parsed, {
+    atime: null,
+    charset: null,
+    comment: null,
+    ctime: new Date('1970-01-01T03:25:45.000Z'),
+    gid: null,
+    gname: null,
+    linkpath: '54321',
+    mtime: null,
+    path: '12345',
+    size: null,
+    uid: null,
+    uname: null,
+    dev: null,
+    ino: null,
+    nlink: null,
+    global: false
+  })
+  t.end()
+})

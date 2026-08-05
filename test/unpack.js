@@ -8,6 +8,7 @@ const t = require('tap')
 const MiniPass = require('minipass')
 
 const makeTar = require('./make-tar.js')
+const Pax = require('../lib/pax.js')
 const Header = require('../lib/header.js')
 const z = require('minizlib')
 const fs = require('fs')
@@ -3760,4 +3761,54 @@ t.test('no linking through a symlink', {
   }
 
   t.end()
+})
+
+// A PAX header entry with a numeric-looking path (eg '12345') must be
+// extracted as a file named '12345', not crash or skip, in strict and
+// non-strict mode.  (CVE-2026-59871)
+const makePaxNameData = (paxName, entryName) => {
+  const paxHeader = new Pax({ path: paxName, size: '12345\n'.length }, false)
+  const paxData = paxHeader.encode()
+  return makeTar([
+    paxData,
+    {
+      type: 'File',
+      path: entryName,
+      mode: 0o755,
+      ctime: new Date('2000-01-01T00:00:00.000Z'),
+      mtime: new Date('2000-01-01T00:00:00.000Z'),
+      size: '12345\n'.length
+    },
+    '12345\n',
+    '',
+    ''
+  ])
+}
+
+const paxNameStricts = [ true, false ]
+const paxNames = [ '12345', 'abcde' ]
+
+paxNameStricts.forEach(strict => {
+  paxNames.forEach(paxName => {
+    paxNames.forEach(entryName => {
+      const label = 'numeric pax/entry name discernment strict=' + strict +
+        ' paxName=' + paxName + ' entryName=' + entryName
+      const data = makePaxNameData(paxName, entryName)
+
+      t.test(label + ' sync', t => {
+        const cwd = testdir()
+        new UnpackSync({ strict: strict, cwd: cwd }).end(data)
+        t.equal(fs.readFileSync(cwd + '/' + paxName, 'utf8'), '12345\n')
+        t.end()
+      })
+
+      t.test(label + ' async', t => {
+        const cwd = testdir()
+        new Unpack({ strict: strict, cwd: cwd }).on('end', () => {
+          t.equal(fs.readFileSync(cwd + '/' + paxName, 'utf8'), '12345\n')
+          t.end()
+        }).end(data)
+      })
+    })
+  })
 })

@@ -949,6 +949,115 @@ t.test('.. paths', t => {
   t.end()
 })
 
+t.test('drive-relative paths', t => {
+  const dir = path.join(unpackdir, 'drive-relative-paths')
+  const cwd = path.resolve(dir, 'cwd')
+  t.teardown(_ => rimraf.sync(dir))
+
+  const setup = _ => {
+    rimraf.sync(dir)
+    mkdirp.sync(cwd)
+  }
+
+  const tarWithPath = p => makeTar([
+    {
+      path: p,
+      type: 'File',
+      size: 1,
+      mtime: new Date('2011-03-27T22:16:31.000Z')
+    },
+    'a',
+    '',
+    ''
+  ])
+
+  // A windows drive-relative path like 'c:..\foo\bar' is not absolute, and
+  // its '..' is not preceded by a path separator, so it can slip past a
+  // naive dotdot check and then resolve outside of the cwd on windows.
+  const escapes = [
+    'c:..\\foo\\bar',
+    'c:../foo/bar',
+    '/c:../foo/bar',
+    'c:..'
+  ]
+
+  escapes.forEach(p => t.test('reject ' + JSON.stringify(p), t => {
+    const data = tarWithPath(p)
+    const warnings = []
+
+    const check = t => {
+      t.same(warnings, [[
+        'path contains \'..\'',
+        p
+      ]], 'warned about the dotted path')
+      t.same(fs.readdirSync(cwd), [], 'nothing extracted into cwd')
+      t.same(fs.readdirSync(dir), [ 'cwd' ], 'nothing escaped the cwd')
+      t.end()
+    }
+
+    t.test('async', t => {
+      setup()
+      warnings.length = 0
+      new Unpack({
+        cwd: cwd,
+        onwarn: (w, d) => warnings.push([w, d])
+      }).on('close', _ => check(t)).end(data)
+    })
+
+    t.test('sync', t => {
+      setup()
+      warnings.length = 0
+      new UnpackSync({
+        cwd: cwd,
+        onwarn: (w, d) => warnings.push([w, d])
+      }).end(data)
+      check(t)
+    })
+
+    t.end()
+  }))
+
+  // the drive root gets stripped, just like any other absolute root, so a
+  // harmless drive-relative path still lands inside the cwd
+  t.test('strip drive root', t => {
+    const p = 'c:foo/bar'
+    const data = tarWithPath(p)
+    const warnings = []
+
+    const check = t => {
+      t.same(warnings, [[
+        'stripping c: from absolute path',
+        p
+      ]], 'warned about stripping the drive root')
+      t.ok(fs.lstatSync(path.resolve(cwd, 'foo/bar')).isFile(), 'is file')
+      t.end()
+    }
+
+    t.test('async', t => {
+      setup()
+      warnings.length = 0
+      new Unpack({
+        cwd: cwd,
+        onwarn: (w, d) => warnings.push([w, d])
+      }).on('close', _ => check(t)).end(data)
+    })
+
+    t.test('sync', t => {
+      setup()
+      warnings.length = 0
+      new UnpackSync({
+        cwd: cwd,
+        onwarn: (w, d) => warnings.push([w, d])
+      }).end(data)
+      check(t)
+    })
+
+    t.end()
+  })
+
+  t.end()
+})
+
 t.test('fail all stats', t => {
   const poop = new Error('poop')
   poop.code = 'EPOOP'

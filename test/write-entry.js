@@ -362,7 +362,11 @@ t.test('nonexistent file', t => {
 })
 
 t.test('absolute path', t => {
-  const f = path.resolve(files, '512-bytes.txt')
+  const absolute = path.resolve(files, '512-bytes.txt')
+  const root = path.parse(absolute).root
+  // stack up several roots, so that a single strip is not enough
+  const f = root + root + root + absolute
+  const warn = root + root + root + root
   t.test('preservePaths=false strict=false', t => {
     const warnings = []
     const ws = new WriteEntry(f, {
@@ -377,11 +381,12 @@ t.test('absolute path', t => {
       t.match(warnings, [[
         /stripping .* from absolute path/, f
       ]])
+      t.equal(warnings[0][0], 'stripping ' + warn + ' from absolute path')
 
       t.match(ws.header, {
         cksumValid: true,
         needPax: false,
-        path: f.replace(/^(\/|[a-z]:\\\\)/, ''),
+        path: f.replace(/^(\/|[a-z]:\\\\){4}/, ''),
         mode: 0o644,
         size: 512,
         linkpath: null,
@@ -1078,6 +1083,38 @@ t.test('write entry from read entry', t => {
       }))
       t.end()
     })
+    t.end()
+  })
+
+  t.test('stacked abs path', t => {
+    // stripping a single root is not enough here: the result would still
+    // be absolute, and would be written outside of the extraction dir
+    const fileEntry = new ReadEntry(new Header(data))
+    fileEntry.path = '////a/b/c'
+
+    t.test('warn and strip every root', t => {
+      const warnings = []
+      const wetFile = new WriteEntry.Tar(fileEntry, {
+        onwarn: (msg, data) => warnings.push(msg, data)
+      })
+      t.same(warnings, ['stripping //// from absolute path', '////a/b/c'])
+      t.equal(wetFile.path, 'a/b/c')
+      t.notOk(path.isAbsolute(wetFile.path))
+      t.notOk(path.win32.isAbsolute(wetFile.path))
+      t.end()
+    })
+
+    t.test('preserve', t => {
+      const warnings = []
+      const wetFile = new WriteEntry.Tar(fileEntry, {
+        onwarn: (msg, data) => warnings.push(msg, data),
+        preservePaths: true
+      })
+      t.same(warnings, [])
+      t.equal(wetFile.path, '////a/b/c')
+      t.end()
+    })
+
     t.end()
   })
 

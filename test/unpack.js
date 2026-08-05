@@ -771,9 +771,14 @@ t.test('absolute paths', t => {
   const relative = absolute.substr(parsed.root.length)
   t.notOk(path.isAbsolute(relative))
 
+  // stack up several roots, so that stripping just one is not enough to
+  // make the path relative
+  const extraAbsolute = parsed.root + parsed.root + parsed.root + absolute
+  t.ok(path.isAbsolute(extraAbsolute))
+
   const data = makeTar([
     {
-      path: absolute,
+      path: extraAbsolute,
       type: 'File',
       size: 1,
       atime: new Date('1979-07-01T19:10:00.000Z'),
@@ -785,13 +790,31 @@ t.test('absolute paths', t => {
     ''
   ])
 
+  // list every file under d, as paths relative to it
+  const findFiles = (d, prefix) => {
+    const found = []
+    fs.readdirSync(d).forEach(e => {
+      const full = d + '/' + e
+      const rel = prefix ? prefix + '/' + e : e
+      if (fs.lstatSync(full).isDirectory())
+        found.push.apply(found, findFiles(full, rel))
+      else
+        found.push(rel)
+    })
+    return found
+  }
+
   t.test('warn and correct', t => {
     const check = t => {
-      t.same(warnings, [[
-        'stripping / from absolute path',
-        absolute
-      ]])
-      t.ok(fs.lstatSync(path.resolve(dir, relative)).isFile(), 'is file')
+      t.equal(warnings.length, 1)
+      t.match(warnings[0][0], /^stripping .+ from absolute path$/)
+      t.equal(warnings[0][1], extraAbsolute)
+      // every stacked root gets stripped, so the entry lands under the cwd,
+      // rather than remaining absolute after a single strip
+      const found = findFiles(dir)
+      t.equal(found.length, 1, 'exactly one file extracted')
+      t.equal(path.basename(found[0]), 'absolute')
+      t.equal(fs.readFileSync(path.resolve(dir, found[0]), 'utf8'), 'a')
       t.end()
     }
 

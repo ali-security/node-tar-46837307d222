@@ -21,6 +21,8 @@ const rimraf = require('rimraf')
 const mkdirp = require('mkdirp')
 const mutateFS = require('mutate-fs')
 const eos = require('end-of-stream')
+const requireInject = require('./utils/require-inject.js')
+const isWindows = process.platform === 'win32'
 
 t.teardown(_ => rimraf.sync(unpackdir))
 
@@ -29,6 +31,21 @@ t.test('setup', t => {
   mkdirp.sync(unpackdir)
   t.end()
 })
+
+const testdir = () => {
+  const testdirpath = path.resolve(unpackdir, Math.random().toString())
+  rimraf.sync(testdirpath)
+  mkdirp.sync(testdirpath)
+  return testdirpath
+}
+
+// [...map.entries()] is a SyntaxError on node 4, which is in the support
+// matrix, so materialize + sort the dirCache the long way round.
+const cacheEntries = cache => {
+  const entries = []
+  cache.forEach((val, key) => entries.push([key, val]))
+  return entries.sort((a, b) => a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)
+}
 
 t.test('basic file unpack tests', t => {
   const basedir = path.resolve(unpackdir, 'basic')
@@ -2866,4 +2883,299 @@ t.test('prune dirCache case-insensitively', t => {
       .end(data)
     check(t, cwd, dirCache)
   })
+})
+
+t.test('dirCache pruning unicode normalized collisions', {
+  skip: isWindows && 'symlinks not fully supported',
+}, t => {
+  const data = makeTar([
+    {
+      type: 'Directory',
+      path: 'foo',
+    },
+    {
+      type: 'File',
+      path: 'foo/bar',
+      size: 1,
+    },
+    'x',
+    {
+      type: 'Directory',
+      // café
+      path: Buffer.from([0x63, 0x61, 0x66, 0xc3, 0xa9]).toString(),
+    },
+    {
+      type: 'SymbolicLink',
+      // cafe with a `
+      path: Buffer.from([0x63, 0x61, 0x66, 0x65, 0xcc, 0x81]).toString(),
+      linkpath: 'foo',
+    },
+    {
+      type: 'File',
+      path: Buffer.from([0x63, 0x61, 0x66, 0xc3, 0xa9]).toString() + '/bar',
+      size: 1,
+    },
+    'y',
+    '',
+    '',
+  ])
+
+  const check = (path, dirCache, t) => {
+    path = path.replace(/\\/g, '/')
+    // The unicode-colliding directory did not survive the symlink entry in
+    // the cache, so the trailing file could not take a stale cache hit and
+    // get written straight through the link.  It is legitimately back in
+    // the cache here, re-added by the lstat-verified mkdir that the file
+    // entry had to perform once the stale entry was gone.
+    const cafeNFC = Buffer.from([0x63, 0x61, 0x66, 0xc3, 0xa9]).toString()
+    t.strictSame(cacheEntries(dirCache), [
+      [path, true],
+      [`${path}/${cafeNFC}`, true],
+      [`${path}/foo`, true],
+    ].sort((a, b) => a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+    t.equal(fs.readFileSync(path + '/foo/bar', 'utf8'), 'x')
+    t.end()
+  }
+
+  t.test('sync', t => {
+    const path = testdir()
+    const dirCache = new Map()
+    new UnpackSync({ cwd: path, dirCache: dirCache })
+      .on('warn', _ => _)
+      .end(data)
+    check(path, dirCache, t)
+  })
+  t.test('async', t => {
+    const path = testdir()
+    const dirCache = new Map()
+    new Unpack({ cwd: path, dirCache: dirCache })
+      .on('warn', _ => _)
+      .on('close', () => check(path, dirCache, t))
+      .end(data)
+  })
+
+  t.end()
+})
+
+// CVE-2021-37712: pruneCache used to compare cache keys byte-exactly (after
+// lowercasing), so a directory cached under its NFC form ('café') was
+// left in the dirCache by a symlink entry named with the NFD form
+// ('café').  On a unicode-squashing filesystem the symlink then aliased
+// that directory, and any entry beneath it took the cache hit, skipped the
+// symlink check in mkdir, and was written straight through the link.
+//
+// A unicode-squashing filesystem cannot be simulated on the Linux CI
+// filesystem, so assert the pruning itself: after the differently-normalized
+// symlink entry, neither the stale directory nor any of its children may
+// remain in the dirCache.
+t.test('prune dirCache on unicode normalization collision', {
+  skip: isWindows && 'symlinks not fully supported',
+}, t => {
+  // café, precomposed (NFC)
+  const cafeNFC = Buffer.from([0x63, 0x61, 0x66, 0xc3, 0xa9]).toString()
+  // cafe + combining acute accent (NFD)
+  const cafeNFD = Buffer.from([0x63, 0x61, 0x66, 0x65, 0xcc, 0x81]).toString()
+
+  const dir = path.resolve(unpackdir, 'prune-cache-unicode')
+  mkdirp.sync(dir + '/sync')
+  mkdirp.sync(dir + '/async')
+
+  const data = makeTar([
+    {
+      path: cafeNFC,
+      type: 'Directory'
+    },
+    {
+      path: cafeNFC + '/child',
+      type: 'Directory'
+    },
+    {
+      path: cafeNFD,
+      type: 'SymbolicLink',
+      linkpath: './z'
+    },
+    '',
+    ''
+  ])
+
+  const check = (t, cwd, dirCache) => {
+    t.equal(dirCache.has(cwd + '/' + cafeNFC), false,
+      'stale unicode-colliding dir pruned')
+    t.equal(dirCache.has(cwd + '/' + cafeNFC + '/child'), false,
+      'stale unicode-colliding child pruned')
+    // the extraction root itself is not a collision, so it survives.
+    t.equal(dirCache.get(cwd), true, 'cwd left in cache')
+    t.end()
+  }
+
+  t.plan(2)
+
+  t.test('async', t => {
+    const cwd = dir + '/async'
+    const dirCache = new Map()
+    new Unpack({ cwd: cwd, dirCache: dirCache })
+      .on('warn', _ => _)
+      .on('end', () => check(t, cwd, dirCache))
+      .end(data)
+  })
+
+  t.test('sync', t => {
+    const cwd = dir + '/sync'
+    const dirCache = new Map()
+    new UnpackSync({ cwd: cwd, dirCache: dirCache })
+      .on('warn', _ => _)
+      .end(data)
+    check(t, cwd, dirCache)
+  })
+})
+
+// CVE-2021-37712: a dirCache key carrying trailing slashes AND a different
+// unicode normalization from the colliding symlink's entry.absolute matched
+// neither the exact-key nor the prefix branch of the old prune, so it
+// survived and aliased the link for every entry underneath it.  The fix
+// strips trailing slashes and NFKD-normalizes both sides of the comparison.
+t.test('prune dirCache on trailing-slash + unicode collision', {
+  skip: isWindows && 'symlinks not fully supported',
+}, t => {
+  // café, precomposed (NFC) -- what the directory got cached as
+  const cafeNFC = Buffer.from([0x63, 0x61, 0x66, 0xc3, 0xa9]).toString()
+  // cafe + combining acute accent (NFD) -- what the symlink entry is named
+  const cafeNFD = Buffer.from([0x63, 0x61, 0x66, 0x65, 0xcc, 0x81]).toString()
+
+  const dir = path.resolve(unpackdir, 'prune-cache-slash')
+  mkdirp.sync(dir + '/sync')
+  mkdirp.sync(dir + '/async')
+
+  const data = makeTar([
+    {
+      path: cafeNFD,
+      type: 'SymbolicLink',
+      linkpath: './z'
+    },
+    '',
+    ''
+  ])
+
+  const check = (t, cwd, dirCache) => {
+    t.equal(dirCache.has(cwd + '/' + cafeNFC + '/'), false,
+      'trailing-slash colliding key pruned')
+    t.equal(dirCache.has(cwd + '/' + cafeNFC + '/child/'), false,
+      'trailing-slash colliding child key pruned')
+    t.equal(dirCache.get(cwd), true, 'cwd left in cache')
+    t.end()
+  }
+
+  const seed = cwd => {
+    const dirCache = new Map()
+    dirCache.set(cwd, true)
+    dirCache.set(cwd + '/' + cafeNFC + '/', true)
+    dirCache.set(cwd + '/' + cafeNFC + '/child/', true)
+    return dirCache
+  }
+
+  t.plan(2)
+
+  t.test('async', t => {
+    const cwd = dir + '/async'
+    const dirCache = seed(cwd)
+    new Unpack({ cwd: cwd, dirCache: dirCache })
+      .on('warn', _ => _)
+      .on('end', () => check(t, cwd, dirCache))
+      .end(data)
+  })
+
+  t.test('sync', t => {
+    const cwd = dir + '/sync'
+    const dirCache = seed(cwd)
+    new UnpackSync({ cwd: cwd, dirCache: dirCache })
+      .on('warn', _ => _)
+      .end(data)
+    check(t, cwd, dirCache)
+  })
+})
+
+t.test('dircache prune all on windows when symlink encountered', t => {
+  if (process.platform !== 'win32') {
+    process.env.TESTING_TAR_FAKE_PLATFORM = 'win32'
+    t.teardown(() => {
+      delete process.env.TESTING_TAR_FAKE_PLATFORM
+    })
+  }
+  const symlinks = []
+  // Object.assign rather than object spread -- node 4/6 in the support
+  // matrix cannot parse `{ ...fs }`.
+  const WinUnpack = requireInject('../lib/unpack.js', {
+    fs: Object.assign({}, fs, {
+      symlink: (target, dest, cb) => {
+        symlinks.push(['async', target, dest])
+        process.nextTick(cb)
+      },
+      symlinkSync: (target, dest) => symlinks.push(['sync', target, dest]),
+    }),
+  })
+  const WinUnpackSync = WinUnpack.Sync
+
+  const data = makeTar([
+    {
+      type: 'Directory',
+      path: 'foo',
+    },
+    {
+      type: 'File',
+      path: 'foo/bar',
+      size: 1,
+    },
+    'x',
+    {
+      type: 'Directory',
+      // café
+      path: Buffer.from([0x63, 0x61, 0x66, 0xc3, 0xa9]).toString(),
+    },
+    {
+      type: 'SymbolicLink',
+      // cafe with a `
+      path: Buffer.from([0x63, 0x61, 0x66, 0x65, 0xcc, 0x81]).toString(),
+      linkpath: 'safe/actually/but/cannot/be/too/careful',
+    },
+    {
+      type: 'File',
+      path: 'bar/baz',
+      size: 1,
+    },
+    'z',
+    '',
+    '',
+  ])
+
+  const check = (path, dirCache, t) => {
+    // symlink blew away all dirCache entries before it
+    path = path.replace(/\\/g, '/')
+    t.strictSame(cacheEntries(dirCache), [
+      [`${path}`, true],
+      [`${path}/bar`, true],
+    ].sort((a, b) => a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+    t.equal(fs.readFileSync(`${path}/foo/bar`, 'utf8'), 'x')
+    t.equal(fs.readFileSync(`${path}/bar/baz`, 'utf8'), 'z')
+    t.end()
+  }
+
+  t.test('sync', t => {
+    const path = testdir()
+    const dirCache = new Map()
+    new WinUnpackSync({ cwd: path, dirCache: dirCache })
+      .on('warn', _ => _)
+      .end(data)
+    check(path, dirCache, t)
+  })
+
+  t.test('async', t => {
+    const path = testdir()
+    const dirCache = new Map()
+    new WinUnpack({ cwd: path, dirCache: dirCache })
+      .on('warn', _ => _)
+      .on('close', () => check(path, dirCache, t))
+      .end(data)
+  })
+
+  t.end()
 })

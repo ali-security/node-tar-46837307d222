@@ -3662,3 +3662,102 @@ t.test('GHSA-34x7-hfp2-rc4v hardlink .. escape', t => {
 
   t.end()
 })
+
+// CVE-2026-26960: a pair of symbolic links planted earlier in the same
+// archive can be chained so that a third entry's linkpath resolves outside
+// the extraction directory.  'a/b/up' points at the cwd, 'a/b/escape' points
+// through it at the cwd's parent, so 'a/b/escape/exploited-file' names a file
+// above the extraction target.  Creating a hard link there hands out a second,
+// writable name for it; creating a symbolic link there means the next write
+// through the link escapes.  Neither link may be created: every existing
+// component of a link's target must be checked, and a symbolic link among
+// them is fatal.
+t.test('no linking through a symlink', {
+  skip: isWindows && 'symlinks not fully supported',
+}, t => {
+  const message = 'TAR_SYMLINK_ERROR: Cannot extract through symbolic link'
+  const types = [ 'Link', 'SymbolicLink' ]
+
+  for (const type of types) {
+    t.test(type, t => {
+      const exploit = makeTar([
+        {
+          type: 'SymbolicLink',
+          path: 'a/b/up',
+          linkpath: '../..',
+          mode: 0o755
+        },
+        {
+          type: 'SymbolicLink',
+          path: 'a/b/escape',
+          linkpath: 'up/..',
+          mode: 0o755
+        },
+        {
+          type: type,
+          path: 'exploit',
+          linkpath: 'a/b/escape/exploited-file',
+          mode: 0o755
+        },
+        '',
+        ''
+      ])
+
+      // the extraction target is a subdirectory, so that the chained links
+      // resolve to a file the archive has no business touching.
+      const setup = () => {
+        const basedir = testdir()
+        const cwd = path.resolve(basedir, 'x')
+        mkdirp.sync(cwd)
+        fs.writeFileSync(path.resolve(basedir, 'exploited-file'),
+          'original content')
+        return { basedir: basedir, cwd: cwd }
+      }
+
+      const check = (t, dirs) => {
+        const exploitPath = path.resolve(dirs.cwd, 'exploit')
+        const outside = path.resolve(dirs.basedir, 'exploited-file')
+
+        // the link was not created at all
+        t.throws(_ => fs.lstatSync(exploitPath), { code: 'ENOENT' },
+          'no link created for the exploit entry')
+
+        // and writing to that name stays inside the extraction directory
+        // instead of following a link out of it
+        fs.writeFileSync(exploitPath, 'pwned')
+        t.equal(fs.readFileSync(outside, 'utf8'), 'original content',
+          'file outside the extraction directory is untouched')
+        t.equal(fs.lstatSync(exploitPath).isFile(), true,
+          'wrote an ordinary file, not through a link')
+        t.equal(fs.readFileSync(exploitPath, 'utf8'), 'pwned',
+          'the write landed inside the extraction directory')
+        t.end()
+      }
+
+      t.test('sync', t => {
+        const dirs = setup()
+        t.throws(_ => {
+          new UnpackSync({ cwd: dirs.cwd, strict: true }).end(exploit)
+        }, { message: message }, 'unpacking raised the symlink error')
+        check(t, dirs)
+      })
+
+      t.test('async', t => {
+        const dirs = setup()
+        const errors = []
+        new Unpack({ cwd: dirs.cwd, strict: true })
+          .on('error', er => errors.push(er))
+          .on('close', _ => {
+            t.equal(errors.length, 1, 'exactly one error raised')
+            t.equal(errors[0].message, message, 'raised the symlink error')
+            check(t, dirs)
+          })
+          .end(exploit)
+      })
+
+      t.end()
+    })
+  }
+
+  t.end()
+})

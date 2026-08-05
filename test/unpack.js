@@ -11,6 +11,7 @@ const makeTar = require('./make-tar.js')
 const Header = require('../lib/header.js')
 const z = require('minizlib')
 const fs = require('fs')
+const os = require('os')
 const path = require('path')
 const fixtures = path.resolve(__dirname, 'fixtures')
 const files = path.resolve(fixtures, 'files')
@@ -1167,10 +1168,53 @@ t.test('linkpath escapes extraction directory', t => {
     t.end()
   }))
 
-  // a rooted linkpath that stays inside the extraction dir once resolved is
-  // still written verbatim, exactly as before
-  t.test('allow non-escaping linkpath', t => {
+  // a rooted linkpath that stays inside the extraction dir once resolved does
+  // not trip the escape check above, but its root is still stripped, and the
+  // '..' left behind is rejected by the generic linkpath sanitization
+  t.test('reject non-escaping but rooted dotted linkpath', t => {
     const lp = 'c:..\\foo\\bar'
+    const data = tarWithLink('a/b/ok', lp)
+    const warnings = []
+
+    const check = t => {
+      t.same(warnings, [[
+        'linkpath contains \'..\'',
+        lp
+      ]], 'warned about the dotted linkpath')
+      t.throws(_ => fs.lstatSync(path.resolve(cwd, 'a/b/ok')),
+        'dotted symlink is not created')
+      t.same(fs.readdirSync(cwd), [], 'nothing extracted into cwd')
+      t.same(fs.readdirSync(dir), [ 'cwd' ], 'nothing escaped the cwd')
+      t.end()
+    }
+
+    t.test('async', t => {
+      setup()
+      warnings.length = 0
+      new Unpack({
+        cwd: cwd,
+        onwarn: (w, d) => warnings.push([w, d])
+      }).on('close', _ => check(t)).end(data)
+    })
+
+    t.test('sync', t => {
+      setup()
+      warnings.length = 0
+      new UnpackSync({
+        cwd: cwd,
+        onwarn: (w, d) => warnings.push([w, d])
+      }).end(data)
+      check(t)
+    })
+
+    t.end()
+  })
+
+  // negative control: a rootless linkpath with no '..' in it is harmless, and
+  // must still be written to disk verbatim with no warnings at all, so that
+  // neither the escape check nor the generic sanitization is over-broad
+  t.test('allow plain relative linkpath', t => {
+    const lp = 'foo/bar'
     const data = tarWithLink('a/b/ok', lp)
     const warnings = []
 
@@ -3257,6 +3301,216 @@ t.test('excessively deep subfolder nesting', t => {
     }).end(shallow)
     t.equal(warnings.length, 0, 'no warnings')
     t.equal(fs.readFileSync(path.resolve(cwd, 'a/b/c.txt'), 'utf8'), 'x')
+    t.end()
+  })
+
+  t.end()
+})
+
+t.test('GHSA-8qq5-rm4j-mr97 linkpath sanitization', t => {
+  const tarWithLink = (p, type, lp) => makeTar([
+    {
+      path: p,
+      type: type,
+      linkpath: lp,
+      mtime: new Date('2011-03-27T22:16:31.000Z')
+    },
+    '',
+    ''
+  ])
+
+  // an absolute symlink linkpath is written to disk verbatim, so it hands the
+  // archive a symlink to anywhere on the filesystem.  The root is stripped,
+  // exactly like an absolute entry.path is.
+  t.test('strip root of absolute symlink linkpath', t => {
+    const lp = '/some/absolute/path'
+    const data = tarWithLink('sym', 'SymbolicLink', lp)
+    const warnings = []
+
+    const check = (t, cwd) => {
+      t.same(warnings, [[
+        'stripping / from absolute linkpath',
+        lp
+      ]], 'warned about stripping the linkpath root')
+      const sym = path.resolve(cwd, 'sym')
+      t.ok(fs.lstatSync(sym).isSymbolicLink(), 'is symlink')
+      t.equal(fs.readlinkSync(sym), 'some/absolute/path',
+        'linkpath is no longer absolute')
+      t.end()
+    }
+
+    t.test('async', t => {
+      const cwd = testdir()
+      warnings.length = 0
+      new Unpack({
+        cwd: cwd,
+        onwarn: (w, d) => warnings.push([w, d])
+      }).on('close', _ => check(t, cwd)).end(data)
+    })
+
+    t.test('sync', t => {
+      const cwd = testdir()
+      warnings.length = 0
+      new UnpackSync({
+        cwd: cwd,
+        onwarn: (w, d) => warnings.push([w, d])
+      }).end(data)
+      check(t, cwd)
+    })
+
+    t.end()
+  })
+
+  // hard link linkpaths are resolved against the cwd, so an absolute linkpath
+  // used to reach any file on the system, and the resulting hardlink then
+  // exposed that file for writing through the extraction directory.
+  t.test('absolute hardlink linkpath cannot reach outside the cwd', t => {
+    // keep this short: the header linkpath field is only 100 bytes
+    const secretFile = path.resolve(os.tmpdir(),
+      'tar-ghsa-8qq5-' + Math.random().toString(36).substr(2) + '.txt')
+    t.ok(secretFile.length < 100, 'linkpath fits in the tar header')
+    t.teardown(_ => rimraf.sync(secretFile))
+
+    const data = tarWithLink('exploit_hard', 'Link', secretFile)
+    const warnings = []
+    const root = path.parse(secretFile).root
+
+    const check = (t, cwd) => {
+      // the failed fs.link surfaces as a second warning, so only pin the first
+      t.same(warnings.slice(0, 1), [[
+        'stripping ' + root + ' from absolute linkpath',
+        secretFile
+      ]], 'warned about stripping the linkpath root')
+      // the de-rooted linkpath resolves inside the cwd, where nothing exists,
+      // so no hardlink to the secret file is ever created
+      const hard = path.resolve(cwd, 'exploit_hard')
+      t.throws(_ => fs.lstatSync(hard), 'no hardlink was created')
+      try {
+        fs.writeFileSync(hard, 'OVERWRITTEN')
+      } catch (er) {}
+      t.equal(fs.readFileSync(secretFile, 'utf8'), 'ORIGINAL DATA',
+        'secret file outside the cwd is untouched')
+      t.end()
+    }
+
+    t.test('async', t => {
+      const cwd = testdir()
+      warnings.length = 0
+      fs.writeFileSync(secretFile, 'ORIGINAL DATA')
+      new Unpack({
+        cwd: cwd,
+        onwarn: (w, d) => warnings.push([w, d])
+      }).on('close', _ => check(t, cwd)).end(data)
+    })
+
+    t.test('sync', t => {
+      const cwd = testdir()
+      warnings.length = 0
+      fs.writeFileSync(secretFile, 'ORIGINAL DATA')
+      new UnpackSync({
+        cwd: cwd,
+        onwarn: (w, d) => warnings.push([w, d])
+      }).end(data)
+      check(t, cwd)
+    })
+
+    t.end()
+  })
+
+  // a rootless linkpath full of '..' walks out of the extraction directory on
+  // every platform, and carries no root for the drive-relative escape check to
+  // key on, so it has to be rejected outright.
+  t.test('reject rootless dotted symlink linkpath', t => {
+    const lp = '../../../etc/passwd'
+    const data = tarWithLink('sym', 'SymbolicLink', lp)
+    const warnings = []
+
+    const check = (t, cwd) => {
+      t.same(warnings, [[
+        'linkpath contains \'..\'',
+        lp
+      ]], 'warned about the dotted linkpath')
+      t.throws(_ => fs.lstatSync(path.resolve(cwd, 'sym')),
+        'escaping symlink is not created')
+      t.same(fs.readdirSync(cwd), [], 'nothing extracted into cwd')
+      t.end()
+    }
+
+    t.test('async', t => {
+      const cwd = testdir()
+      warnings.length = 0
+      new Unpack({
+        cwd: cwd,
+        onwarn: (w, d) => warnings.push([w, d])
+      }).on('close', _ => check(t, cwd)).end(data)
+    })
+
+    t.test('sync', t => {
+      const cwd = testdir()
+      warnings.length = 0
+      new UnpackSync({
+        cwd: cwd,
+        onwarn: (w, d) => warnings.push([w, d])
+      }).end(data)
+      check(t, cwd)
+    })
+
+    t.end()
+  })
+
+  // negative control: an ordinary relative linkpath is still written verbatim,
+  // with no warnings, for both link types
+  t.test('allow ordinary relative linkpath', t => {
+    const lp = 'sibling/file'
+    const data = tarWithLink('sym', 'SymbolicLink', lp)
+    const warnings = []
+
+    const check = (t, cwd) => {
+      t.same(warnings, [], 'no warnings')
+      const sym = path.resolve(cwd, 'sym')
+      t.ok(fs.lstatSync(sym).isSymbolicLink(), 'is symlink')
+      t.equal(fs.readlinkSync(sym), lp, 'linkpath is not modified')
+      t.end()
+    }
+
+    t.test('async', t => {
+      const cwd = testdir()
+      warnings.length = 0
+      new Unpack({
+        cwd: cwd,
+        onwarn: (w, d) => warnings.push([w, d])
+      }).on('close', _ => check(t, cwd)).end(data)
+    })
+
+    t.test('sync', t => {
+      const cwd = testdir()
+      warnings.length = 0
+      new UnpackSync({
+        cwd: cwd,
+        onwarn: (w, d) => warnings.push([w, d])
+      }).end(data)
+      check(t, cwd)
+    })
+
+    t.end()
+  })
+
+  // preservePaths opts out of every sanitization, including the linkpath ones
+  t.test('preservePaths keeps the absolute linkpath', t => {
+    const lp = '/some/absolute/path'
+    const data = tarWithLink('sym', 'SymbolicLink', lp)
+    const warnings = []
+    const cwd = testdir()
+
+    new UnpackSync({
+      cwd: cwd,
+      preservePaths: true,
+      onwarn: (w, d) => warnings.push([w, d])
+    }).end(data)
+
+    t.same(warnings, [], 'no warnings')
+    t.equal(fs.readlinkSync(path.resolve(cwd, 'sym')), lp,
+      'linkpath is preserved')
     t.end()
   })
 

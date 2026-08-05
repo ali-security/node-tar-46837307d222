@@ -1058,6 +1058,115 @@ t.test('drive-relative paths', t => {
   t.end()
 })
 
+t.test('linkpath escapes extraction directory', t => {
+  const dir = path.join(unpackdir, 'linkpath-escape')
+  const cwd = path.resolve(dir, 'cwd')
+  t.teardown(_ => rimraf.sync(dir))
+
+  const setup = _ => {
+    rimraf.sync(dir)
+    mkdirp.sync(cwd)
+  }
+
+  const tarWithLink = (p, lp) => makeTar([
+    {
+      path: p,
+      type: 'SymbolicLink',
+      linkpath: lp,
+      mtime: new Date('2011-03-27T22:16:31.000Z')
+    },
+    '',
+    ''
+  ])
+
+  // A rooted linkpath is written to disk verbatim, so once its root is
+  // dropped, the remaining '..' parts can walk out of the extraction dir.
+  const escapes = [
+    { path: 'a/b/link', linkpath: 'c:..\\..\\..\\..\\foo\\bar' },
+    { path: 'a/b/link', linkpath: 'c:../../../foo/bar' },
+    { path: 'a/b/link', linkpath: '/c:../../../foo/bar' },
+    { path: 'link', linkpath: 'c:..' }
+  ]
+
+  escapes.forEach(c => t.test('reject ' + JSON.stringify(c.linkpath), t => {
+    const data = tarWithLink(c.path, c.linkpath)
+    const warnings = []
+
+    const check = t => {
+      t.same(warnings, [[
+        'linkpath escapes extraction directory',
+        c.linkpath
+      ]], 'warned about the escaping linkpath')
+      t.throws(_ => fs.lstatSync(path.resolve(cwd, c.path)),
+        'escaping symlink is not created')
+      t.same(fs.readdirSync(cwd), [], 'nothing extracted into cwd')
+      t.same(fs.readdirSync(dir), [ 'cwd' ], 'nothing escaped the cwd')
+      t.end()
+    }
+
+    t.test('async', t => {
+      setup()
+      warnings.length = 0
+      new Unpack({
+        cwd: cwd,
+        onwarn: (w, d) => warnings.push([w, d])
+      }).on('close', _ => check(t)).end(data)
+    })
+
+    t.test('sync', t => {
+      setup()
+      warnings.length = 0
+      new UnpackSync({
+        cwd: cwd,
+        onwarn: (w, d) => warnings.push([w, d])
+      }).end(data)
+      check(t)
+    })
+
+    t.end()
+  }))
+
+  // a rooted linkpath that stays inside the extraction dir once resolved is
+  // still written verbatim, exactly as before
+  t.test('allow non-escaping linkpath', t => {
+    const lp = 'c:..\\foo\\bar'
+    const data = tarWithLink('a/b/ok', lp)
+    const warnings = []
+
+    const check = t => {
+      t.same(warnings, [], 'no warnings')
+      t.ok(fs.lstatSync(path.resolve(cwd, 'a/b/ok')).isSymbolicLink(),
+        'is symlink')
+      t.equal(fs.readlinkSync(path.resolve(cwd, 'a/b/ok')), lp,
+        'linkpath is not modified')
+      t.end()
+    }
+
+    t.test('async', t => {
+      setup()
+      warnings.length = 0
+      new Unpack({
+        cwd: cwd,
+        onwarn: (w, d) => warnings.push([w, d])
+      }).on('close', _ => check(t)).end(data)
+    })
+
+    t.test('sync', t => {
+      setup()
+      warnings.length = 0
+      new UnpackSync({
+        cwd: cwd,
+        onwarn: (w, d) => warnings.push([w, d])
+      }).end(data)
+      check(t)
+    })
+
+    t.end()
+  })
+
+  t.end()
+})
+
 t.test('fail all stats', t => {
   const poop = new Error('poop')
   poop.code = 'EPOOP'

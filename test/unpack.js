@@ -23,6 +23,7 @@ const mutateFS = require('mutate-fs')
 const eos = require('end-of-stream')
 const requireInject = require('./utils/require-inject.js')
 const isWindows = process.platform === 'win32'
+const ReadEntry = require('../lib/read-entry.js')
 
 t.teardown(_ => rimraf.sync(unpackdir))
 
@@ -3175,6 +3176,88 @@ t.test('dircache prune all on windows when symlink encountered', t => {
       .on('warn', _ => _)
       .on('close', () => check(path, dirCache, t))
       .end(data)
+  })
+
+  t.end()
+})
+
+t.test('excessively deep subfolder nesting', t => {
+  const tf = path.resolve(fixtures, 'excessively-deep.tar')
+  const data = fs.readFileSync(tf)
+  const warnings = []
+  const onwarn = (w, d) => warnings.push([w, d])
+
+  const check = (t, cwd, maxDepth) => {
+    maxDepth = maxDepth || 1024
+    t.equal(warnings.length, 1, 'got exactly one warning')
+    t.equal(warnings[0][0], 'path excessively deep')
+    const d = warnings[0][1]
+    t.ok(d.entry instanceof ReadEntry, 'warning carries the skipped entry')
+    t.match(d.path, /^\.(\/a){1024,}\/foo\.txt$/)
+    t.equal(d.depth, 222372)
+    t.equal(d.maxDepth, maxDepth)
+    // the entry was skipped, so nothing at all landed in the cwd
+    t.same(fs.readdirSync(cwd), [], 'nothing extracted')
+    warnings.length = 0
+    t.end()
+  }
+
+  t.test('async', t => {
+    const cwd = testdir()
+    new Unpack({
+      cwd: cwd,
+      onwarn: onwarn
+    }).on('end', () => check(t, cwd)).end(data)
+  })
+
+  t.test('sync', t => {
+    const cwd = testdir()
+    new UnpackSync({
+      cwd: cwd,
+      onwarn: onwarn
+    }).end(data)
+    check(t, cwd)
+  })
+
+  t.test('async set md', t => {
+    const cwd = testdir()
+    new Unpack({
+      cwd: cwd,
+      onwarn: onwarn,
+      maxDepth: 64
+    }).on('end', () => check(t, cwd, 64)).end(data)
+  })
+
+  t.test('sync set md', t => {
+    const cwd = testdir()
+    new UnpackSync({
+      cwd: cwd,
+      onwarn: onwarn,
+      maxDepth: 64
+    }).end(data)
+    check(t, cwd, 64)
+  })
+
+  t.test('maxDepth:Infinity disables the check', t => {
+    const cwd = testdir()
+    const shallow = makeTar([
+      {
+        path: 'a/b/c.txt',
+        type: 'File',
+        size: 1
+      },
+      'x',
+      '',
+      ''
+    ])
+    new UnpackSync({
+      cwd: cwd,
+      onwarn: onwarn,
+      maxDepth: Infinity
+    }).end(shallow)
+    t.equal(warnings.length, 0, 'no warnings')
+    t.equal(fs.readFileSync(path.resolve(cwd, 'a/b/c.txt'), 'utf8'), 'x')
+    t.end()
   })
 
   t.end()

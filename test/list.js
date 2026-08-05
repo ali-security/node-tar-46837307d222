@@ -192,6 +192,85 @@ t.test('read fail', t => {
   t.end()
 })
 
+// GHSA-r292-9mhp-454m: the recursion inside filesFilter()'s mapHas() must be
+// bounded.  Given a files list, mapHas() walks a candidate entry's path up to
+// the root one path.dirname() at a time, recursing once per path segment, so a
+// crafted archive entry with a very deeply nested path crashes the process with
+// an uncatchable stack overflow.
+t.test('GHSA-r292-9mhp-454m deep path does not overflow stack', t => {
+  const makeTar = require('./make-tar.js')
+
+  // test/make-tar.js encodes the path through Header.encode(), which splits it
+  // across the 155-byte prefix and 100-byte path fields and truncates whatever
+  // does not fit, so an archived path cannot carry more than ~255 bytes.  The
+  // archived entry below stays inside that budget (and the first subtest proves
+  // it survives intact); the recursion bound itself is exercised through the
+  // installed filter directly, in the last subtest.
+  const segments = []
+  for (let i = 0; i < 40; i++)
+    segments.push('x' + i)
+  const deepPath = segments.join('/')
+  const data = makeTar([
+    { path: deepPath, type: 'File', size: 0 },
+    '',
+    ''
+  ])
+
+  t.test('archived deep path survives makeTar intact', t => {
+    const listed = []
+    const p = list({ onentry: e => listed.push(e.path) })
+    p.on('error', er => { throw er })
+    p.on('end', _ => {
+      t.same(listed, [ deepPath ], 'fixture really is deeply nested')
+      t.end()
+    })
+    p.end(data)
+  })
+
+  t.test('unmatched deep path is filtered out', t => {
+    const listed = []
+    // A files list that does NOT include deepPath is what triggers mapHas() to
+    // walk all the way up to the root, one dirname() at a time.
+    const p = list(
+      { onentry: e => listed.push(e.path) },
+      [ 'some/other/path' ]
+    )
+    p.on('error', er => { throw er })
+    p.on('end', _ => {
+      t.equal(listed.length, 0, 'no entries listed for unmatched deep path')
+      t.end()
+    })
+    p.end(data)
+  })
+
+  // filesFilter() installs the mapHas() closure as opt.filter, and Parser keeps
+  // it as this.filter, so the bound can be driven with a path far deeper than
+  // any tar header is able to carry.  Unbounded, this dies with
+  // 'RangeError: Maximum call stack size exceeded'.
+  t.test('depth bound stops runaway recursion', t => {
+    const deeper = []
+    for (let i = 0; i < 20000; i++)
+      deeper.push('y' + i)
+    const veryDeepPath = deeper.join('/')
+
+    const p = list({}, [ 'some/other/path' ])
+    t.equal(typeof p.filter, 'function', 'files list installed a filter')
+
+    let threw = null
+    let result = null
+    try {
+      result = p.filter(veryDeepPath, {})
+    } catch (er) {
+      threw = er
+    }
+    t.equal(threw, null, 'no stack overflow walking a 20000-segment path')
+    t.equal(result, false, 'unmatched deep path is filtered out')
+    t.end()
+  })
+
+  t.end()
+})
+
 t.test('noResume option', t => {
   const file = path.resolve(__dirname, 'fixtures/tars/file.tar')
   t.test('sync', t => {

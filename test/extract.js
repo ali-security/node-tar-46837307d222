@@ -369,3 +369,70 @@ t.test('max decompression ratio', t => {
 
   t.end()
 })
+
+// GHSA-r292-9mhp-454m: the recursion inside filesFilter()'s mapHas() must be
+// bounded.  Given a files list, mapHas() walks a candidate entry's path up to
+// the root one path.dirname() at a time, recursing once per path segment, so a
+// crafted archive entry with a very deeply nested path crashes the process with
+// an uncatchable stack overflow.
+t.test('GHSA-r292-9mhp-454m deep path does not overflow stack', t => {
+  // test/make-tar.js encodes the path through Header.encode(), which splits it
+  // across the 155-byte prefix and 100-byte path fields and truncates whatever
+  // does not fit, so an archived path cannot carry more than ~255 bytes.  The
+  // archived entry below stays inside that budget; the recursion bound itself is
+  // exercised through the installed filter directly, in the last subtest.
+  const segments = []
+  for (let i = 0; i < 40; i++)
+    segments.push('x' + i)
+  const deepPath = segments.join('/')
+  const data = makeTar([
+    { path: deepPath, type: 'File', size: 0 },
+    '',
+    ''
+  ])
+
+  t.test('unmatched deep path extracts nothing', t => {
+    const dir = path.resolve(extractdir, 'ghsa-r292')
+    rimraf.sync(dir)
+    mkdirp.sync(dir)
+
+    // A files list that does NOT include deepPath is what triggers mapHas() to
+    // walk all the way up to the root, one dirname() at a time.
+    const u = x({ cwd: dir }, [ 'some/other/path' ])
+    u.on('error', er => { throw er })
+    u.on('close', _ => {
+      t.same(fs.readdirSync(dir), [],
+        'no files extracted for unmatched deep path')
+      rimraf.sync(dir)
+      t.end()
+    })
+    u.end(data)
+  })
+
+  // filesFilter() installs the mapHas() closure as opt.filter, and Unpack
+  // inherits Parser's this.filter, so the bound can be driven with a path far
+  // deeper than any tar header is able to carry.  Unbounded, this dies with
+  // 'RangeError: Maximum call stack size exceeded'.
+  t.test('depth bound stops runaway recursion', t => {
+    const deeper = []
+    for (let i = 0; i < 20000; i++)
+      deeper.push('y' + i)
+    const veryDeepPath = deeper.join('/')
+
+    const u = x({}, [ 'some/other/path' ])
+    t.equal(typeof u.filter, 'function', 'files list installed a filter')
+
+    let threw = null
+    let result = null
+    try {
+      result = u.filter(veryDeepPath, {})
+    } catch (er) {
+      threw = er
+    }
+    t.equal(threw, null, 'no stack overflow walking a 20000-segment path')
+    t.equal(result, false, 'unmatched deep path is filtered out')
+    t.end()
+  })
+
+  t.end()
+})

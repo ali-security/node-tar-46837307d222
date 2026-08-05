@@ -1169,21 +1169,25 @@ t.test('linkpath escapes extraction directory', t => {
   }))
 
   // a rooted linkpath that stays inside the extraction dir once resolved does
-  // not trip the escape check above, but its root is still stripped, and the
-  // '..' left behind is rejected by the generic linkpath sanitization
-  t.test('reject non-escaping but rooted dotted linkpath', t => {
+  // not trip the escape check above, so only its root is stripped.  The '..'
+  // left behind is allowed, because a symbolic link pointing up out of the
+  // extraction dir is inert on its own -- what matters is that nothing is
+  // extracted *through* it.
+  t.test('allow non-escaping but rooted dotted linkpath', t => {
     const lp = 'c:..\\foo\\bar'
     const data = tarWithLink('a/b/ok', lp)
     const warnings = []
 
     const check = t => {
       t.same(warnings, [[
-        'linkpath contains \'..\'',
+        'stripping c: from absolute linkpath',
         lp
-      ]], 'warned about the dotted linkpath')
-      t.throws(_ => fs.lstatSync(path.resolve(cwd, 'a/b/ok')),
-        'dotted symlink is not created')
-      t.same(fs.readdirSync(cwd), [], 'nothing extracted into cwd')
+      ]], 'warned about stripping the linkpath root')
+      const sym = path.resolve(cwd, 'a/b/ok')
+      t.ok(fs.lstatSync(sym).isSymbolicLink(), 'is symlink')
+      t.equal(fs.readlinkSync(sym), '..\\foo\\bar',
+        'linkpath is no longer rooted')
+      t.same(fs.readdirSync(cwd), [ 'a' ], 'only extracted into cwd')
       t.same(fs.readdirSync(dir), [ 'cwd' ], 'nothing escaped the cwd')
       t.end()
     }
@@ -3417,12 +3421,53 @@ t.test('GHSA-8qq5-rm4j-mr97 linkpath sanitization', t => {
     t.end()
   })
 
-  // a rootless linkpath full of '..' walks out of the extraction directory on
-  // every platform, and carries no root for the drive-relative escape check to
-  // key on, so it has to be rejected outright.
-  t.test('reject rootless dotted symlink linkpath', t => {
+  // a rootless linkpath full of '..' is written to disk verbatim for a
+  // symbolic link, and that is fine: the symlink itself only *points* out of
+  // the extraction directory, it does not write there.  Extracting through
+  // such a link is what is dangerous, and that is blocked separately.
+  t.test('allow rootless dotted symlink linkpath', t => {
     const lp = '../../../etc/passwd'
     const data = tarWithLink('sym', 'SymbolicLink', lp)
+    const warnings = []
+
+    const check = (t, cwd) => {
+      t.same(warnings, [], 'no warnings')
+      const sym = path.resolve(cwd, 'sym')
+      t.ok(fs.lstatSync(sym).isSymbolicLink(), 'is symlink')
+      t.equal(fs.readlinkSync(sym), lp, 'linkpath is not modified')
+      t.same(fs.readdirSync(cwd), [ 'sym' ], 'only the symlink extracted')
+      t.end()
+    }
+
+    t.test('async', t => {
+      const cwd = testdir()
+      warnings.length = 0
+      new Unpack({
+        cwd: cwd,
+        onwarn: (w, d) => warnings.push([w, d])
+      }).on('close', _ => check(t, cwd)).end(data)
+    })
+
+    t.test('sync', t => {
+      const cwd = testdir()
+      warnings.length = 0
+      new UnpackSync({
+        cwd: cwd,
+        onwarn: (w, d) => warnings.push([w, d])
+      }).end(data)
+      check(t, cwd)
+    })
+
+    t.end()
+  })
+
+  // GHSA-34x7-hfp2-rc4v: a hard link's linkpath is resolved against the cwd
+  // by fs.link, so a rootless linkpath full of '..' hands the archive a
+  // writable hard link to any file above the extraction directory.  Unlike a
+  // symbolic link's, a hard link's dotted linkpath must be rejected.
+  t.test('reject rootless dotted hardlink linkpath', t => {
+    const lp = '../../../etc/passwd'
+    const data = tarWithLink('exploit_hard', 'Link', lp)
     const warnings = []
 
     const check = (t, cwd) => {
@@ -3430,8 +3475,8 @@ t.test('GHSA-8qq5-rm4j-mr97 linkpath sanitization', t => {
         'linkpath contains \'..\'',
         lp
       ]], 'warned about the dotted linkpath')
-      t.throws(_ => fs.lstatSync(path.resolve(cwd, 'sym')),
-        'escaping symlink is not created')
+      t.throws(_ => fs.lstatSync(path.resolve(cwd, 'exploit_hard')),
+        'escaping hardlink is not created')
       t.same(fs.readdirSync(cwd), [], 'nothing extracted into cwd')
       t.end()
     }
@@ -3512,6 +3557,107 @@ t.test('GHSA-8qq5-rm4j-mr97 linkpath sanitization', t => {
     t.equal(fs.readlinkSync(path.resolve(cwd, 'sym')), lp,
       'linkpath is preserved')
     t.end()
+  })
+
+  t.end()
+})
+
+t.test('GHSA-34x7-hfp2-rc4v hardlink .. escape', t => {
+  // A hard link's linkpath is resolved against the cwd by fs.link, so a
+  // linkpath containing '..' creates a second, writable name for a file
+  // above the extraction directory.  Those must be rejected.  Symbolic link
+  // linkpaths containing '..' are allowed: they are written to disk verbatim
+  // and only ever *point* outside, which is inert on its own.
+  const dir = testdir()
+  const secretFile = path.resolve(dir, 'secret.txt')
+
+  const hardLp = '../secret.txt'
+  const nestedLp = '../../secret.txt'
+
+  const data = makeTar([
+    {
+      path: 'exploit_hard',
+      type: 'Link',
+      linkpath: hardLp,
+      mtime: new Date('2011-03-27T22:16:31.000Z')
+    },
+    {
+      path: 'sub/',
+      type: 'Directory',
+      mtime: new Date('2011-03-27T22:16:31.000Z')
+    },
+    {
+      path: 'sub/nested_hard',
+      type: 'Link',
+      linkpath: nestedLp,
+      mtime: new Date('2011-03-27T22:16:31.000Z')
+    },
+    {
+      path: 'valid_sym',
+      type: 'SymbolicLink',
+      linkpath: hardLp,
+      mtime: new Date('2011-03-27T22:16:31.000Z')
+    },
+    '',
+    ''
+  ])
+
+  const setup = name => {
+    const cwd = path.resolve(dir, name)
+    rimraf.sync(cwd)
+    mkdirp.sync(cwd)
+    fs.writeFileSync(secretFile, 'ORIGINAL DATA')
+    return cwd
+  }
+
+  const check = (t, cwd, warnings) => {
+    // both hard links are rejected, in archive order, and nothing else warns
+    t.same(warnings, [
+      [ 'linkpath contains \'..\'', hardLp ],
+      [ 'linkpath contains \'..\'', nestedLp ]
+    ], 'warned about both dotted hardlink linkpaths')
+
+    // neither hard link exists, so there is no second name for the secret
+    t.throws(_ => fs.lstatSync(path.resolve(cwd, 'exploit_hard')),
+      'no hardlink was created')
+    t.throws(_ => fs.lstatSync(path.resolve(cwd, 'sub/nested_hard')),
+      'no nested hardlink was created')
+
+    // the secret file above the cwd has exactly one name, and is untouched
+    t.equal(fs.statSync(secretFile).nlink, 1,
+      'secret file still has a single link')
+    t.equal(fs.readFileSync(secretFile, 'utf8'), 'ORIGINAL DATA',
+      'secret file outside the cwd is untouched')
+
+    // a relative symlink is legitimate, and is written verbatim
+    const sym = path.resolve(cwd, 'valid_sym')
+    t.ok(fs.lstatSync(sym).isSymbolicLink(), 'symlink created')
+    t.equal(fs.readlinkSync(sym), hardLp, 'linkpath is not modified')
+
+    t.same(fs.readdirSync(cwd).sort(), [ 'sub', 'valid_sym' ],
+      'only the directory and the symlink were extracted')
+    t.same(fs.readdirSync(path.resolve(cwd, 'sub')), [],
+      'nothing was extracted into the subdirectory')
+    t.end()
+  }
+
+  t.test('async', t => {
+    const cwd = setup('async')
+    const warnings = []
+    new Unpack({
+      cwd: cwd,
+      onwarn: (w, d) => warnings.push([w, d])
+    }).on('close', _ => check(t, cwd, warnings)).end(data)
+  })
+
+  t.test('sync', t => {
+    const cwd = setup('sync')
+    const warnings = []
+    new UnpackSync({
+      cwd: cwd,
+      onwarn: (w, d) => warnings.push([w, d])
+    }).end(data)
+    check(t, cwd, warnings)
   })
 
   t.end()

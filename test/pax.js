@@ -253,3 +253,43 @@ t.test('parse', t => {
 
   t.end()
 })
+
+t.test('no negative size', t => {
+  t.same(Pax.parse('14 size=-1000\n'), {
+    atime: null,
+    charset: null,
+    comment: null,
+    ctime: null,
+    gid: null,
+    gname: null,
+    linkpath: null,
+    mtime: null,
+    path: null,
+    size: null,
+    uid: null,
+    uname: null,
+    dev: null,
+    ino: null,
+    nlink: null,
+    global: false
+  })
+  t.same(Pax.parse('13 size=1000\n'), {
+    atime: null,
+    charset: null,
+    comment: null,
+    ctime: null,
+    gid: null,
+    gname: null,
+    linkpath: null,
+    mtime: null,
+    path: null,
+    size: 1000,
+    uid: null,
+    uname: null,
+    dev: null,
+    ino: null,
+    nlink: null,
+    global: false
+  })
+  t.end()
+})

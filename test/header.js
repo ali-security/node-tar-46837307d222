@@ -605,3 +605,10 @@ t.test('do not apply ex/gex to meta entries', t => {
 
   t.end()
 })
+
+t.test('no negative size', t => {
+  const i = new Header({ size: -1000 })
+  // stubbornly refuse
+  t.equal(i.size, null)
+  t.end()
+})
